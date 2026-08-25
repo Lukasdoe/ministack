@@ -2882,7 +2882,7 @@ def _admin_add_user_to_group(data):
         return error_response_json("ResourceNotFoundException", f"Group {group_name} not found.", 400)
     if group_name not in user.get("_groups", []):
         user.setdefault("_groups", []).append(group_name)
-        pool["_groups"][group_name].setdefault("_members", []).append(username)
+        pool["_groups"][group_name].setdefault("_members", []).append(user["Username"])
     return json_response({})
 
 
@@ -2900,8 +2900,8 @@ def _admin_remove_user_from_group(data):
         user["_groups"].remove(group_name)
     if group_name in pool["_groups"]:
         members = pool["_groups"][group_name].get("_members", [])
-        if username in members:
-            members.remove(username)
+        if user["Username"] in members:
+            members.remove(user["Username"])
     return json_response({})
 
 

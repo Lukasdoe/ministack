@@ -4717,6 +4717,32 @@ def test_cognito_admin_delete_user_by_email_alias(cognito_idp):
     cognito_idp.admin_create_user(UserPoolId=pid, Username="erin@example.com")
 
 
+def test_cognito_admin_group_membership_by_email_alias(cognito_idp):
+    """Group membership must record the resolved Username. Storing the
+    caller-supplied alias made ListUsersInGroup drop the member, because it
+    looks members up as "_users" keys."""
+    pid = cognito_idp.create_user_pool(
+        PoolName="GroupAliasPool",
+        UsernameAttributes=["email"],
+    )["UserPool"]["Id"]
+    real_username = cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username="frank@example.com",
+    )["User"]["Username"]
+    cognito_idp.create_group(UserPoolId=pid, GroupName="admins")
+
+    cognito_idp.admin_add_user_to_group(
+        UserPoolId=pid, Username="frank@example.com", GroupName="admins",
+    )
+    members = cognito_idp.list_users_in_group(UserPoolId=pid, GroupName="admins")["Users"]
+    assert [u["Username"] for u in members] == [real_username]
+
+    cognito_idp.admin_remove_user_from_group(
+        UserPoolId=pid, Username="frank@example.com", GroupName="admins",
+    )
+    assert cognito_idp.list_users_in_group(UserPoolId=pid, GroupName="admins")["Users"] == []
+
+
 def test_auth_codes_dict_types_are_plain_builtin_dict():
     """`_auth_codes` and `_authorization_codes` must remain plain `dict`
     instances. They're looked up by random unguessable token from a public
