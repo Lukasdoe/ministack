@@ -2640,7 +2640,9 @@ def _admin_delete_user(data):
     user, err = _resolve_user(pool, username)
     if err:
         return err
-    del pool["_users"][username]
+    # Delete by the resolved Username. In a UsernameAttributes pool the caller
+    # can pass an alias (email), which is not the "_users" key.
+    del pool["_users"][user["Username"]]
     pool["EstimatedNumberOfUsers"] = len(pool["_users"])
     return json_response({})
 

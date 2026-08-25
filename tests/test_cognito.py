@@ -4695,6 +4695,28 @@ def test_cognito_username_attributes_lookup_by_email(cognito_idp):
     assert user["Username"] == real_username
 
 
+def test_cognito_admin_delete_user_by_email_alias(cognito_idp):
+    """AdminDeleteUser must delete the user that the alias resolves to. In a
+    UsernameAttributes pool the "_users" key is a generated UUID, so a delete
+    keyed on the caller-supplied email raised KeyError and the user survived.
+    A delete-then-create seed then failed with UsernameExistsException."""
+    pid = cognito_idp.create_user_pool(
+        PoolName="DeleteAliasPool",
+        UsernameAttributes=["email"],
+    )["UserPool"]["Id"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="erin@example.com")
+
+    cognito_idp.admin_delete_user(UserPoolId=pid, Username="erin@example.com")
+
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.admin_get_user(UserPoolId=pid, Username="erin@example.com")
+    assert exc.value.response["Error"]["Code"] == "UserNotFoundException"
+    assert cognito_idp.list_users(UserPoolId=pid)["Users"] == []
+
+    # The pool accepts the same email again.
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="erin@example.com")
+
+
 def test_auth_codes_dict_types_are_plain_builtin_dict():
     """`_auth_codes` and `_authorization_codes` must remain plain `dict`
     instances. They're looked up by random unguessable token from a public
