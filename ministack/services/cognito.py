@@ -1176,6 +1176,79 @@ def _resolve_user(pool: dict, username: str):
     )
 
 
+def _hides_user_existence(pool: dict, client_id: str) -> bool:
+    """
+    Whether this app client must not reveal that a user is unknown.
+
+    With PreventUserExistenceErrors=ENABLED, real Cognito makes an unknown
+    username indistinguishable from a wrong password across the flows it names:
+    USER_PASSWORD_AUTH, USER_SRP_AUTH and ADMIN_USER_PASSWORD_AUTH answer
+    NotAuthorizedException, ForgotPassword and ResendConfirmationCode answer a
+    normal CodeDeliveryDetails, and ConfirmForgotPassword answers
+    CodeMismatchException.
+
+    The setting is a property of the app client, so it covers the admin
+    *authentication* flow as well — AWS lists ADMIN_USER_PASSWORD_AUTH
+    explicitly. It does not cover the directory operations: AdminGetUser and
+    friends keep reporting UserNotFoundException.
+
+    Two flows are deliberately untouched, as AWS handles them by other means:
+    CUSTOM_AUTH, where Cognito instead invokes the challenge Lambda with
+    UserNotFound=true, and the USER_AUTH choice-based flow, which the setting
+    does not affect.
+    """
+    client = (pool.get("_clients") or {}).get(client_id) or {}
+    return client.get("PreventUserExistenceErrors", "LEGACY") == "ENABLED"
+
+
+def _hidden_user_error(pool: dict, client_id: str, err):
+    """
+    `err` unless this client hides user existence, in which case the generic
+    auth failure that a wrong password also produces.
+
+    Used by every branch of the auth flows AWS names for the setting —
+    USER_PASSWORD_AUTH, USER_SRP_AUTH and ADMIN_USER_PASSWORD_AUTH — including
+    the RespondToAuthChallenge steps that continue them, because that is where
+    an SRP sign-in resolves the user: masking only InitiateAuth would leave the
+    browser flow leaking.
+    """
+    if _hides_user_existence(pool, client_id):
+        return error_response_json(
+            "NotAuthorizedException", "Incorrect username or password.", 400,
+        )
+    return err
+
+
+def _masked_destination(address: str) -> str:
+    """
+    Mask a delivery destination the way Cognito reports it: j****@e****.
+
+    Applied to BOTH the real and the unknown-user path, which is what makes the
+    two indistinguishable: returning the full address for a real user and a mask
+    for an unknown one would just move the enumeration oracle into this field.
+    AWS masks it in either case, and drops the domain suffix as well.
+
+    For a user who does not exist there is no stored address to mask, so the
+    requested username is masked instead — the same substitution AWS documents
+    for ForgotPassword, whose simulated destination is "determined by the input
+    username format".
+    """
+    if not address or "@" not in address:
+        return "****"
+    local, _, domain = address.partition("@")
+    return f"{local[:1]}****@{domain[:1]}****"
+
+
+def _code_delivery_response(destination: str):
+    return json_response({
+        "CodeDeliveryDetails": {
+            "Destination": destination,
+            "DeliveryMedium": "EMAIL",
+            "AttributeName": "email",
+        }
+    })
+
+
 def _user_out(user: dict) -> dict:
     """Serialise a user dict for API responses."""
     return {
@@ -2142,6 +2215,17 @@ def _create_user_pool(data):
     if not name:
         return error_response_json("InvalidParameterException", "PoolName is required.", 400)
 
+    # "You can't require that users provide a value for the attribute" — a
+    # custom (or developer-only) schema entry with Required=true is a pool
+    # real Cognito refuses to create.
+    for raw in data.get("Schema") or []:
+        if (isinstance(raw, dict) and raw.get("Required")
+                and _schema_attribute_name(raw).startswith(
+                    (_ATTRIBUTE_CUSTOM_PREFIX, _ATTRIBUTE_DEV_PREFIX))):
+            return error_response_json(
+                "InvalidParameterException",
+                "Required custom attributes are not supported.", 400)
+
     pid = _pool_id()
     now = _now_epoch()
     pool = {
@@ -2196,6 +2280,8 @@ def _create_user_pool(data):
         pool["UserPoolAddOns"] = data["UserPoolAddOns"]
     if data.get("VerificationMessageTemplate"):
         pool["VerificationMessageTemplate"] = data["VerificationMessageTemplate"]
+    if data.get("UserAttributeUpdateSettings"):
+        pool["UserAttributeUpdateSettings"] = data["UserAttributeUpdateSettings"]
     _user_pools[pid] = pool
     logger.info("Cognito: CreateUserPool %s (%s)", name, pid)
     return json_response({"UserPool": _pool_out(pool)})
@@ -2251,6 +2337,7 @@ def _update_user_pool(data):
         "EmailConfiguration", "SmsConfiguration", "UserPoolTags",
         "AdminCreateUserConfig", "UserPoolAddOns", "VerificationMessageTemplate",
         "AccountRecoverySetting", "LambdaConfig",
+        "UserAttributeUpdateSettings",
     }
     for k in updatable:
         if k in data:
@@ -2300,6 +2387,10 @@ def _add_custom_attributes(data):
             return error_response_json(
                 "InvalidParameterException",
                 f"{attr['Name']}: Attribute already exists in the schema.", 400)
+        if attr.get("Required"):
+            return error_response_json(
+                "InvalidParameterException",
+                "Required custom attributes are not supported.", 400)
         existing.add(attr["Name"])
         additions.append(attr)
 
@@ -2372,7 +2463,7 @@ def _create_user_pool_client(data):
         "AllowedOAuthScopes": data.get("AllowedOAuthScopes", []),
         "AllowedOAuthFlowsUserPoolClient": data.get("AllowedOAuthFlowsUserPoolClient", False),
         "AnalyticsConfiguration": data.get("AnalyticsConfiguration"),
-        "PreventUserExistenceErrors": data.get("PreventUserExistenceErrors", "ENABLED"),
+        "PreventUserExistenceErrors": data.get("PreventUserExistenceErrors", "LEGACY"),
         "EnableTokenRevocation": data.get("EnableTokenRevocation", True),
         "EnablePropagateAdditionalUserContextData": data.get("EnablePropagateAdditionalUserContextData", False),
         "AuthSessionValidity": data.get("AuthSessionValidity", 3),
@@ -3058,19 +3149,15 @@ def _resend_confirmation_code(data):
 
     user = pool["_users"].get(username)
     if not user:
+        if _hides_user_existence(pool, cid):
+            return _code_delivery_response(_masked_destination(username))
         return error_response_json("UserNotFoundException", "User does not exist.", 400)
 
     code = user.get("_confirmation_code") or "123456"
     user["_confirmation_code"] = code
     attrs = _attr_list_to_dict(user.get("Attributes", []))
     _send_verification_email(pool, username, attrs, code)
-    return json_response({
-        "CodeDeliveryDetails": {
-            "Destination": attrs.get("email", ""),
-            "DeliveryMedium": "EMAIL",
-            "AttributeName": "email",
-        }
-    })
+    return _code_delivery_response(_masked_destination(attrs.get("email") or username))
 
 
 def _admin_user_global_sign_out(data):
@@ -3109,14 +3196,33 @@ def _admin_list_groups_for_user(data):
 
 
 def _admin_list_user_auth_events(data):
+    """List a user's auth events, gated on user-pool add-ons as real Cognito is.
+
+    Auth events are never recorded here (there is no event store), so a pool
+    with add-ons enabled always answers an empty list. A pool without add-ons
+    (AdvancedSecurityMode OFF or UserPoolAddOns absent) is refused with
+    UserPoolAddOnNotEnabledException. The add-on gate fires before the user is
+    resolved — measured against the live service (2026-08-26): an unknown user
+    in a pool without add-ons gets the add-on error, not UserNotFound.
+    """
     pid = data.get("UserPoolId")
     pool, err = _resolve_pool(pid)
     if err:
         return err
+    if (pool.get("UserPoolAddOns") or {}).get("AdvancedSecurityMode", "OFF") == "OFF":
+        return error_response_json(
+            "UserPoolAddOnNotEnabledException",
+            "This is an add on feature. Please update AdvancedSecurityMode"
+            " for your user pool to access this API.",
+            400,
+        )
     username = data.get("Username")
-    _, err = _resolve_user(pool, username)
-    if err:
-        return err
+    user, _ = _resolve_user(pool, username)
+    if user is None:
+        # Real AWS answers this op with the plain message, without the name.
+        return error_response_json(
+            "UserNotFoundException", "User does not exist.", 400,
+        )
     return json_response({"AuthEvents": []})
 
 
@@ -3224,9 +3330,12 @@ def _admin_initiate_auth(data):
         password = auth_params.get("PASSWORD")
         user, _err = _resolve_user(pool, username)
         if _err:
-            return _err
+            return _hidden_user_error(pool, cid, _err)
         if not user.get("Enabled", True):
             return error_response_json("NotAuthorizedException", "User is disabled.", 400)
+        refused = _password_signin_refused(user)
+        if refused:
+            return refused
         if user.get("_password") and user["_password"] != password:
             return error_response_json("NotAuthorizedException", "Incorrect username or password.", 400)
         if user.get("UserStatus") == "FORCE_CHANGE_PASSWORD":
@@ -3401,7 +3510,10 @@ def _admin_respond_to_auth_challenge(data):
             user, err = _resolve_user(pool, username)
             if err:
                 del _challenge_sessions[token]
-                return err
+                return _hidden_user_error(pool, cid, err)
+            refused = _password_signin_refused(user)
+            if refused:
+                return refused
             _append_challenge_to_session(session, "PASSWORD_VERIFIER", True, None, {}, {})
             session["pending_builtin_challenge"] = None
             user_attrs = _attr_list_to_dict(user.get("Attributes", []))
@@ -3423,7 +3535,10 @@ def _admin_respond_to_auth_challenge(data):
         client_metadata = data.get("ClientMetadata", {})
         user, _err = _resolve_user(pool, username)
         if _err:
-            return _err
+            return _hidden_user_error(pool, cid, _err)
+        refused = _password_signin_refused(user)
+        if refused:
+            return refused
         if new_password:
             user["_password"] = new_password
         user["UserStatus"] = "CONFIRMED"
@@ -3436,7 +3551,7 @@ def _admin_respond_to_auth_challenge(data):
         client_metadata = data.get("ClientMetadata", {})
         user, _err = _resolve_user(pool, username)
         if _err:
-            return _err
+            return _hidden_user_error(pool, cid, _err)
         return json_response({"AuthenticationResult": _build_auth_result(
             pid, cid, user, client_metadata=client_metadata)})
 
@@ -3445,7 +3560,7 @@ def _admin_respond_to_auth_challenge(data):
         client_metadata = data.get("ClientMetadata", {})
         user, _err = _resolve_user(pool, username)
         if _err:
-            return _err
+            return _hidden_user_error(pool, cid, _err)
         # Accept any TOTP code in emulator — no real TOTP validation
         return json_response({"AuthenticationResult": _build_auth_result(
             pid, cid, user, client_metadata=client_metadata)})
@@ -3456,7 +3571,7 @@ def _admin_respond_to_auth_challenge(data):
         client_metadata = data.get("ClientMetadata", {})
         user, _err = _resolve_user(pool, username)
         if _err:
-            return _err
+            return _hidden_user_error(pool, cid, _err)
         return json_response({"AuthenticationResult": _build_auth_result(
             pid, cid, user, client_metadata=client_metadata)})
 
@@ -3541,9 +3656,12 @@ def _initiate_auth(data):
         password = auth_params.get("PASSWORD")
         user, _err = _resolve_user(pool, username)
         if _err:
-            return _err
+            return _hidden_user_error(pool, cid, _err)
         if not user.get("Enabled", True):
             return error_response_json("NotAuthorizedException", "User is disabled.", 400)
+        refused = _password_signin_refused(user)
+        if refused:
+            return refused
         if user.get("_password") and user["_password"] != password:
             return error_response_json("NotAuthorizedException", "Incorrect username or password.", 400)
         if user.get("UserStatus") == "FORCE_CHANGE_PASSWORD":
@@ -3724,7 +3842,10 @@ def _respond_to_auth_challenge(data):
             user, err = _resolve_user(pool, username)
             if err:
                 del _challenge_sessions[token]
-                return err
+                return _hidden_user_error(pool, cid, err)
+            refused = _password_signin_refused(user)
+            if refused:
+                return refused
             # Emulator parity with USER_SRP_AUTH: accept Amplify's PASSWORD_CLAIM_* without
             # full SRP math.
             _append_challenge_to_session(session, "PASSWORD_VERIFIER", True, None, {}, {})
@@ -3745,7 +3866,10 @@ def _respond_to_auth_challenge(data):
         client_metadata = data.get("ClientMetadata", {})
         user, _err = _resolve_user(pool, username)
         if _err:
-            return _err
+            return _hidden_user_error(pool, cid, _err)
+        refused = _password_signin_refused(user)
+        if refused:
+            return refused
         if new_password:
             user["_password"] = new_password
         user["UserStatus"] = "CONFIRMED"
@@ -3759,7 +3883,10 @@ def _respond_to_auth_challenge(data):
         client_metadata = data.get("ClientMetadata", {})
         user, _err = _resolve_user(pool, username)
         if _err:
-            return _err
+            return _hidden_user_error(pool, cid, _err)
+        refused = _password_signin_refused(user)
+        if refused:
+            return refused
         if new_password:
             user["_password"] = new_password
         user["UserStatus"] = "CONFIRMED"
@@ -3772,7 +3899,7 @@ def _respond_to_auth_challenge(data):
         client_metadata = data.get("ClientMetadata", {})
         user, _err = _resolve_user(pool, username)
         if _err:
-            return _err
+            return _hidden_user_error(pool, cid, _err)
         # Accept any TOTP code in emulator
         return json_response({"AuthenticationResult": _build_auth_result(
             pid, cid, user, client_metadata=client_metadata)})
@@ -3936,19 +4063,17 @@ def _forgot_password(data):
 
     user, _err = _resolve_user(pool, username)
     if _err:
+        if _hides_user_existence(pool, cid):
+            # Answer as though a code had been sent. Nothing is delivered and no
+            # state changes; only the response shape is preserved.
+            return _code_delivery_response(_masked_destination(username))
         return _err
 
     code = "654321"
     user["_reset_code"] = code
     attrs = _attr_list_to_dict(user.get("Attributes", []))
     _send_verification_email(pool, username, attrs, code, attribute_name="password")
-    return json_response({
-        "CodeDeliveryDetails": {
-            "Destination": attrs.get("email", ""),
-            "DeliveryMedium": "EMAIL",
-            "AttributeName": "email",
-        }
-    })
+    return _code_delivery_response(_masked_destination(attrs.get("email") or username))
 
 
 def _confirm_forgot_password(data):
@@ -3966,6 +4091,13 @@ def _confirm_forgot_password(data):
 
     user, _err = _resolve_user(pool, username)
     if _err:
+        if _hides_user_existence(pool, cid):
+            # An unknown username looks like a bad code, which is what a caller
+            # would see for a real user given the wrong code.
+            return error_response_json(
+                "CodeMismatchException",
+                "Invalid verification code provided, please try again.", 400,
+            )
         return _err
 
     # Accept any confirmation code in emulation (real AWS validates against issued code)
@@ -4568,6 +4700,19 @@ def _admin_link_provider_for_user(data):
     return json_response({})
 
 
+def _password_signin_refused(user):
+    """The refusal a password sign-in draws for a provider-deactivated local user.
+
+    AdminDisableProviderForUser with ProviderName=Cognito: "they can't use
+    their password to sign in", while the profile itself stays (AdminGetUser,
+    tokens already issued, and non-password flows are untouched).
+    """
+    if user.get("_provider_disabled"):
+        return error_response_json(
+            "NotAuthorizedException", "Incorrect username or password.", 400)
+    return None
+
+
 def _admin_disable_provider_for_user(data):
     pid = data.get("UserPoolId")
     pool, err = _resolve_pool(pid)
@@ -4577,6 +4722,18 @@ def _admin_disable_provider_for_user(data):
     user_identifier, err = _provider_user_identifier(data, "User")
     if err:
         return err
+
+    # "To deactivate a local user, set ProviderName to Cognito and the
+    # ProviderAttributeName to Cognito_Subject. The ProviderAttributeValue
+    # must be user's local username." The user keeps existing but can no
+    # longer sign in with their password.
+    if user_identifier["ProviderName"] == "Cognito":
+        user, err = _resolve_user(pool, user_identifier["ProviderAttributeValue"])
+        if err:
+            return err
+        user["_provider_disabled"] = True
+        user["UserLastModifiedDate"] = _now_epoch()
+        return json_response({})
 
     links = _provider_links(pool)
     key = _provider_link_key(
@@ -4646,8 +4803,18 @@ def _get_user_pool_mfa_config(data):
     resp = {"MfaConfiguration": pool.get("MfaConfiguration", "OFF")}
     for key in ("SmsMfaConfiguration", "SoftwareTokenMfaConfiguration",
                 "EmailMfaConfiguration", "WebAuthnConfiguration"):
-        if pool.get(key):
-            resp[key] = pool[key]
+        # `is not None`, not truthiness: a caller turning software-token MFA
+        # off sends an empty object — `enabled = false` serialises with the
+        # false field omitted — and that is a value it set, not a field it left
+        # unset. Dropping it makes the caller re-send the change on every run.
+        value = pool.get(key)
+        if value is None:
+            continue
+        if key == "SoftwareTokenMfaConfiguration":
+            value = {"Enabled": bool(value.get("Enabled", False))}
+        elif not value:
+            continue
+        resp[key] = value
     return json_response(resp)
 
 
@@ -4723,8 +4890,18 @@ def _set_user_pool_mfa_config(data):
     resp = {"MfaConfiguration": pool.get("MfaConfiguration", "OFF")}
     for key in ("SmsMfaConfiguration", "SoftwareTokenMfaConfiguration",
                 "EmailMfaConfiguration", "WebAuthnConfiguration"):
-        if pool.get(key):
-            resp[key] = pool[key]
+        # `is not None`, not truthiness: a caller turning software-token MFA
+        # off sends an empty object — `enabled = false` serialises with the
+        # false field omitted — and that is a value it set, not a field it left
+        # unset. Dropping it makes the caller re-send the change on every run.
+        value = pool.get(key)
+        if value is None:
+            continue
+        if key == "SoftwareTokenMfaConfiguration":
+            value = {"Enabled": bool(value.get("Enabled", False))}
+        elif not value:
+            continue
+        resp[key] = value
     return json_response(resp)
 
 
@@ -5550,6 +5727,8 @@ def _authenticate_hosted_ui_user(pool, username, password):
     status_error = _hosted_ui_user_status_error(user)
     if status_error:
         return None, status_error
+    if _password_signin_refused(user) is not None:
+        return None, "Incorrect username or password."
     if user.get("_password") != password:
         return None, "Incorrect username or password."
     return user, ""

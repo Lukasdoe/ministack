@@ -1078,6 +1078,13 @@ def _layer_arn(name: str) -> str:
     return f"arn:aws:lambda:{get_region()}:{get_account_id()}:layer:{name}"
 
 
+def _esm_arn(esm_id: str) -> str:
+    return (
+        f"arn:aws:lambda:{get_region()}:{get_account_id()}"
+        f":event-source-mapping:{esm_id}"
+    )
+
+
 def _now_iso() -> str:
     now = datetime.now(timezone.utc)
     ms = now.microsecond // 1000
@@ -1992,6 +1999,11 @@ def _create_function(data: dict):
         "s3_object_storage_mode": code_data.get("S3ObjectStorageMode"),
         "source_kms_key_arn": code_data.get("SourceKMSKeyArn"),
         "s3_object_ref": _s3_object_ref,
+        # Whether the caller explicitly chose an architecture, as distinct from
+        # the stored x86_64 default. The wire shape is identical either way;
+        # only the Docker executor reads this, to pin the container platform
+        # for functions that actually declared one.
+        "architectures_declared": "Architectures" in data,
         "versions": {},
         "next_version": 1,
         "tags": data.get("Tags", {}),
@@ -2267,6 +2279,12 @@ async def _invoke_with_response_stream(name: str, event: dict, headers: dict,
     provide — so we cannot do any better without a custom RIE fork.
     """
     status, resp_headers, resp_body = await _invoke(name, event, headers, path_qualifier, query_params)
+    # An HTTP-level failure (ResourceNotFoundException 404, throttles, ...)
+    # never streams on AWS: the error is a plain JSON response, and wrapping
+    # it in an eventstream envelope crashes SDK parsers. Only a 200 —
+    # including a handler error, which rides InvokeComplete — is framed.
+    if status != 200:
+        return status, resp_headers, resp_body
     # Detect handler-level errors from the standard invoke path so we can flip
     # to the InvokeError event type in the stream.
     is_error = bool(resp_headers and resp_headers.get("X-Amz-Function-Error"))
@@ -2346,6 +2364,11 @@ def _update_code(name: str, data: dict):
         )
     func = _functions[name]
     code_zip = None
+    # UpdateFunctionCode is where AWS lets the architecture change (the
+    # UpdateFunctionConfiguration model has no Architectures member).
+    if "Architectures" in data:
+        func["config"]["Architectures"] = data["Architectures"]
+        func["architectures_declared"] = True
     if "ImageUri" in data:
         func["config"]["ImageUri"] = data["ImageUri"]
         func["config"]["PackageType"] = "Image"
@@ -2468,6 +2491,8 @@ def _update_config(name: str, data: dict):
                 config["Layers"] = layers_cfg
             else:
                 config[key] = data[key]
+    if "Architectures" in data:
+        _functions[name]["architectures_declared"] = True
     if "ImageConfig" in data:
         config["ImageConfigResponse"] = {"ImageConfig": data["ImageConfig"]}
     config["LastModified"] = _now_iso()
@@ -3631,8 +3656,32 @@ def _parse_docker_flags(flags: str) -> dict:
     return kwargs
 
 
-def _spawn_lambda_container(config: dict, code_zip: bytes | None):
+def _declared_docker_platform(config: dict):
+    """The linux/* platform to pin, or None when the function never declared one.
+
+    Every stored config carries ``Architectures`` because AWS's x86_64 default
+    is echoed on the wire — so the config alone cannot say whether the caller
+    chose an architecture. The function record tracks that at create/update
+    time, and only an explicit choice pins the container platform: pinning the
+    stored default onto undeclared functions would break arm64 hosts with no
+    amd64 binfmt handler, whose functions ran natively before.
+    """
+    func = _functions.get(config.get("FunctionName") or "")
+    if not func or not func.get("architectures_declared"):
+        return None
+    arch = (config.get("Architectures") or ["x86_64"])[0]
+    return "linux/arm64" if arch == "arm64" else "linux/amd64"
+
+
+def _spawn_lambda_container(config: dict, code_zip: bytes | None,
+                            _pin_platform: bool = True):
     """Create and start a Lambda container for the given config.
+
+    A function that explicitly declared an architecture is pinned to it — but
+    only best-effort: a host that cannot run the declared platform (no qemu or
+    Rosetta for the emulation) logs the mismatch and retries on the host's own
+    architecture instead of failing an invoke that worked before the pin
+    existed. `_pin_platform=False` is that retry.
 
     Returns (container, tmpdir). The caller is responsible for pool registration
     and for `_kill_pool_entry` on cleanup (tmpdir is None for Image-type).
@@ -3815,6 +3864,33 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
     if LAMBDA_DOCKER_NETWORK:
         run_kwargs["network"] = LAMBDA_DOCKER_NETWORK
 
+    # AWS runs a function on the architecture it declares. Docker otherwise
+    # picks the host's, so an arm64 function on an x86_64 host quietly ran as
+    # x86_64 — fine until a layer carries a native wheel, at which point the
+    # handler dies at import naming the library rather than the mismatch
+    # ("no pq wrapper available" from psycopg, for instance). Set it before the
+    # flags merge so an explicit --platform in LAMBDA_DOCKER_FLAGS still wins.
+    # Only a function whose creator explicitly chose an architecture is pinned:
+    # every stored record carries the x86_64 default, and pinning that onto
+    # functions that never declared one would break arm64 hosts without a
+    # binfmt handler that ran those functions natively before.
+    docker_platform = _declared_docker_platform(config) if _pin_platform else None
+    docker_arch = docker_platform.rsplit("/", 1)[1] if docker_platform else None
+    if docker_platform:
+        run_kwargs["platform"] = docker_platform
+
+    def _platform_fallback(reason):
+        """The declared platform cannot run here: log it, run on the host's."""
+        logger.warning(
+            "Lambda %s declares %s but this host cannot run it (%s); "
+            "running on the host architecture instead. Install a binfmt/qemu "
+            "handler (or Rosetta) for real cross-architecture execution.",
+            config.get("FunctionName"), docker_platform, reason)
+        if tmpdir and os.path.exists(tmpdir):
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        return _spawn_lambda_container(config, code_zip, _pin_platform=False)
+
     # Apply LAMBDA_DOCKER_FLAGS — merge parsed kwargs into run_kwargs
     if LAMBDA_DOCKER_FLAGS:
         df_kwargs = _parse_docker_flags(LAMBDA_DOCKER_FLAGS)
@@ -3841,12 +3917,21 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
 
     # Pull the image on first use (both Zip RIE images and user Image types)
     try:
-        client.images.get(image)
+        local_image = client.images.get(image)
+        # A cached image of the wrong architecture is as unusable as no image:
+        # docker refuses to start it, and without this check the refusal arrives
+        # as an opaque run error rather than a pull. Only checked when the
+        # function pinned a platform — with no declaration any cached image is
+        # the host's, which is what will run.
+        if docker_arch and local_image.attrs.get("Architecture") not in (None, docker_arch):
+            raise docker_lib.errors.ImageNotFound("cached image is the wrong architecture")
     except docker_lib.errors.ImageNotFound:
-        logger.info("Pulling Lambda image: %s", image)
+        logger.info("Pulling Lambda image: %s (%s)", image, docker_platform or "host platform")
         try:
-            client.images.pull(image)
+            client.images.pull(image, platform=docker_platform)
         except Exception as exc:
+            if docker_platform:
+                return _platform_fallback(f"pull failed: {exc}")
             if tmpdir and os.path.exists(tmpdir):
                 import shutil
                 shutil.rmtree(tmpdir, ignore_errors=True)
@@ -3873,11 +3958,37 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
             container.start()
         else:
             container = client.containers.run(**run_kwargs)
-    except Exception:
+    except Exception as exc:
+        if docker_platform:
+            return _platform_fallback(f"container create/start failed: {exc}")
         if tmpdir and os.path.exists(tmpdir):
             import shutil
             shutil.rmtree(tmpdir, ignore_errors=True)
         raise
+
+    if docker_platform:
+        # A host with no emulation handler starts the container fine and its
+        # entrypoint dies instantly with an exec-format error — docker raises
+        # nothing, and without this check the failure surfaces later as an
+        # opaque invoke timeout. An immediate exit while pinned means the host
+        # cannot run the declared platform: fall back to the host's.
+        time.sleep(0.25)
+        try:
+            container.reload()
+            died = container.status == "exited"
+        except Exception:
+            died = False
+        if died:
+            try:
+                tail = container.logs(tail=5).decode(errors="replace").strip()
+            except Exception:
+                tail = ""
+            try:
+                container.remove(force=True)
+            except Exception:
+                pass
+            return _platform_fallback(
+                f"container exited immediately: {tail or 'no output'}")
 
     return container, tmpdir
 
@@ -6005,8 +6116,18 @@ def _delete_provisioned_concurrency(func_name: str, qualifier: str):
 
 
 def _esm_response(esm: dict) -> dict:
-    """Return ESM dict without internal-only fields."""
-    return {k: v for k, v in esm.items() if k not in ("FunctionName", "Enabled")}
+    """Return ESM dict without internal-only fields.
+
+    EventSourceMappingArn is derived here rather than stored on the record so
+    that mappings created before it existed — restored state included — report
+    it too. Callers cannot construct this ARN themselves, and ListTags is keyed
+    on it, so omitting it leaves tags unreadable.
+    """
+    out = {k: v for k, v in esm.items() if k not in ("FunctionName", "Enabled")}
+    esm_id = esm.get("UUID")
+    if esm_id:
+        out["EventSourceMappingArn"] = _esm_arn(esm_id)
+    return out
 
 
 def _resolve_existing_esm_function(function_ref: str):
@@ -6367,16 +6488,31 @@ def _poll_sqs():
             records = []
             for msg in batch:
                 first_recv = msg.get("first_receive_at") or now
+                attributes = {
+                    "ApproximateReceiveCount": str(msg.get("receive_count", 1)),
+                    "SentTimestamp": str(int(msg["sent_at"] * 1000)),
+                    "SenderId": get_account_id(),
+                    "ApproximateFirstReceiveTimestamp": str(int(first_recv * 1000)),
+                }
+                # AWSTraceHeader carries X-Ray / OpenTelemetry trace context
+                # through SQS into the consumer; AWS delivers it inside the
+                # record's attributes map when the producer set it.
+                trace_header = (msg.get("sys") or {}).get("AWSTraceHeader")
+                if trace_header:
+                    attributes["AWSTraceHeader"] = trace_header
+                # FIFO records carry their sequencing attributes, per the
+                # documented FIFO event shape.
+                if msg.get("group_id"):
+                    attributes["MessageGroupId"] = msg["group_id"]
+                if msg.get("dedup_id"):
+                    attributes["MessageDeduplicationId"] = msg["dedup_id"]
+                if msg.get("seq") is not None:
+                    attributes["SequenceNumber"] = str(msg["seq"])
                 records.append({
                     "messageId": msg["id"],
                     "receiptHandle": msg["receipt_handle"],
                     "body": msg["body"],
-                    "attributes": {
-                        "ApproximateReceiveCount": str(msg.get("receive_count", 1)),
-                        "SentTimestamp": str(int(msg["sent_at"] * 1000)),
-                        "SenderId": get_account_id(),
-                        "ApproximateFirstReceiveTimestamp": str(int(first_recv * 1000)),
-                    },
+                    "attributes": attributes,
                     "messageAttributes": _sqs_message_attributes_to_camel_case(
                         msg.get("message_attributes", {})
                     ),

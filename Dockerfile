@@ -15,6 +15,8 @@ RUN pip install --no-cache-dir --no-compile \
         "pymysql>=1.1" \
         "asyncssh>=2.14" \
         "boto3>=1.34" \
+        "jsonata-python>=0.7.0" \
+        "graphql-core==3.2.12" \
         "awscli==1.45.63"
 
 # Strip awscli help examples (~25 MB) and Python cache files (~15 MB).

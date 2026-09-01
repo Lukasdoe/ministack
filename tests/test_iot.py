@@ -292,6 +292,37 @@ def test_iot_thing_group_membership(iot_client):
     iot_client.delete_thing_group(thingGroupName=gname)
 
 
+def test_iot_list_thing_groups_for_thing(iot_client):
+    tname = _unique("thing")
+    g1 = _unique("group")
+    g2 = _unique("group")
+    iot_client.create_thing(thingName=tname)
+    iot_client.create_thing_group(thingGroupName=g1)
+    iot_client.create_thing_group(thingGroupName=g2)
+
+    # A thing in no groups answers an empty list, not an error.
+    assert iot_client.list_thing_groups_for_thing(thingName=tname)["thingGroups"] == []
+
+    iot_client.add_thing_to_thing_group(thingGroupName=g1, thingName=tname)
+    iot_client.add_thing_to_thing_group(thingGroupName=g2, thingName=tname)
+    groups = iot_client.list_thing_groups_for_thing(thingName=tname)["thingGroups"]
+    assert {g["groupName"] for g in groups} == {g1, g2}
+    for g in groups:
+        assert g["groupArn"].endswith(":thinggroup/" + g["groupName"])
+
+    iot_client.remove_thing_from_thing_group(thingGroupName=g1, thingName=tname)
+    remaining = iot_client.list_thing_groups_for_thing(thingName=tname)["thingGroups"]
+    assert [g["groupName"] for g in remaining] == [g2]
+
+    with pytest.raises(ClientError) as ei:
+        iot_client.list_thing_groups_for_thing(thingName=_unique("absent"))
+    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    iot_client.delete_thing(thingName=tname)
+    iot_client.delete_thing_group(thingGroupName=g1)
+    iot_client.delete_thing_group(thingGroupName=g2)
+
+
 # ---------------------------------------------------------------------------
 # Certificates (issued via the Local CA)
 # ---------------------------------------------------------------------------
@@ -592,6 +623,179 @@ def test_iot_legacy_principal_policy_unknown_policy_404(iot_client):
     assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
     
     
+# ---------------------------------------------------------------------------
+# Provisioning templates (storage + CRUD — no fleet-provisioning MQTT workflow)
+# ---------------------------------------------------------------------------
+
+
+def _provisioning_template_body() -> str:
+    # The real service refuses a body without an AWS::IoT::Certificate
+    # resource, so every valid test body carries one.
+    return json.dumps({
+        "Parameters": {"SerialNumber": {"Type": "String"}},
+        "Resources": {
+            "certificate": {
+                "Type": "AWS::IoT::Certificate",
+                "Properties": {"CertificateId": {"Ref": "AWS::IoT::Certificate::Id"}},
+            },
+            "thing": {
+                "Type": "AWS::IoT::Thing",
+                "Properties": {"ThingName": {"Ref": "SerialNumber"}},
+            },
+        },
+    })
+
+
+def test_iot_provisioning_template_lifecycle(iot_client):
+    name = _unique("provtemplate")
+    body = _provisioning_template_body()
+    role = "arn:aws:iam::000000000000:role/provisioning"
+
+    created = iot_client.create_provisioning_template(
+        templateName=name,
+        description="fleet template",
+        templateBody=body,
+        enabled=True,
+        provisioningRoleArn=role,
+        type="FLEET_PROVISIONING",
+    )
+    assert created["templateName"] == name
+    assert created["templateArn"].endswith(f":provisioningtemplate/{name}")
+    assert created["defaultVersionId"] == 1
+
+    desc = iot_client.describe_provisioning_template(templateName=name)
+    assert desc["templateArn"] == created["templateArn"]
+    assert desc["description"] == "fleet template"
+    assert desc["templateBody"] == body
+    assert desc["enabled"] is True
+    assert desc["provisioningRoleArn"] == role
+    assert desc["type"] == "FLEET_PROVISIONING"
+    assert desc["defaultVersionId"] == 1
+    assert "creationDate" in desc and "lastModifiedDate" in desc
+
+    listed = iot_client.list_provisioning_templates()["templates"]
+    summary = next(t for t in listed if t["templateName"] == name)
+    assert summary["templateArn"] == created["templateArn"]
+    assert summary["enabled"] is True
+    assert summary["type"] == "FLEET_PROVISIONING"
+    # Summaries carry no body, role, or description — same as the live service.
+    assert "templateBody" not in summary
+    assert "provisioningRoleArn" not in summary
+    assert "description" not in summary
+
+    with pytest.raises(ClientError) as ei:
+        iot_client.create_provisioning_template(
+            templateName=name, templateBody=body, provisioningRoleArn=role
+        )
+    assert ei.value.response["Error"]["Code"] == "ResourceAlreadyExistsException"
+    assert ei.value.response["Error"]["Message"] == (
+        f"Template with name {name} already exists"
+    )
+
+    updated = iot_client.update_provisioning_template(
+        templateName=name, description="updated", enabled=False
+    )
+    # The live service answers 200 with an empty body and no version bump.
+    assert set(updated) == {"ResponseMetadata"}
+    desc = iot_client.describe_provisioning_template(templateName=name)
+    assert desc["description"] == "updated"
+    assert desc["enabled"] is False
+    assert desc["defaultVersionId"] == 1
+    # An unmentioned field survives the update.
+    assert desc["provisioningRoleArn"] == role
+
+    iot_client.delete_provisioning_template(templateName=name)
+    with pytest.raises(ClientError) as ei:
+        iot_client.describe_provisioning_template(templateName=name)
+    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    assert ei.value.response["Error"]["Message"] == (
+        f"Unable to find template named {name}"
+    )
+
+
+def test_iot_provisioning_template_body_must_carry_certificate_resource(iot_client):
+    """A body without an AWS::IoT::Certificate resource is refused with the
+    live service's message; unparseable body JSON is refused too."""
+    name = _unique("provtemplate")
+    role = "arn:aws:iam::000000000000:role/provisioning"
+    no_cert = json.dumps({"Resources": {
+        "thing": {"Type": "AWS::IoT::Thing", "Properties": {"ThingName": "t"}},
+    }})
+
+    with pytest.raises(ClientError) as ei:
+        iot_client.create_provisioning_template(
+            templateName=name, templateBody=no_cert, provisioningRoleArn=role
+        )
+    assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
+    assert ei.value.response["Error"]["Message"] == (
+        "The template body is invalid: Template must have certificate resource."
+    )
+
+    with pytest.raises(ClientError) as ei:
+        iot_client.create_provisioning_template(
+            templateName=name, templateBody="not json{", provisioningRoleArn=role
+        )
+    assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
+
+    with pytest.raises(ClientError):
+        iot_client.describe_provisioning_template(templateName=name)
+
+
+def test_iot_provisioning_template_name_validation(iot_client):
+    role = "arn:aws:iam::000000000000:role/provisioning"
+    for bad in ("x" * 37, "no:colons"):
+        with pytest.raises(ClientError) as ei:
+            iot_client.create_provisioning_template(
+                templateName=bad,
+                templateBody=_provisioning_template_body(),
+                provisioningRoleArn=role,
+            )
+        assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
+
+
+def test_iot_provisioning_template_update_unknown_404(iot_client):
+    name = _unique("provtemplate")
+    with pytest.raises(ClientError) as ei:
+        iot_client.update_provisioning_template(templateName=name, enabled=True)
+    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    assert ei.value.response["Error"]["Message"] == (
+        f"Unable to find template named {name}"
+    )
+
+
+def test_iot_provisioning_template_pre_provisioning_hook_roundtrip(iot_client):
+    name = _unique("provtemplate")
+    hook = {
+        "payloadVersion": "2020-04-01",
+        "targetArn": "arn:aws:lambda:us-east-1:000000000000:function:hook",
+    }
+    iot_client.create_provisioning_template(
+        templateName=name,
+        templateBody=_provisioning_template_body(),
+        provisioningRoleArn="arn:aws:iam::000000000000:role/provisioning",
+        preProvisioningHook=hook,
+    )
+    try:
+        assert iot_client.describe_provisioning_template(
+            templateName=name
+        )["preProvisioningHook"] == hook
+
+        iot_client.update_provisioning_template(
+            templateName=name, removePreProvisioningHook=True
+        )
+        desc = iot_client.describe_provisioning_template(templateName=name)
+        assert "preProvisioningHook" not in desc
+
+        iot_client.update_provisioning_template(
+            templateName=name, preProvisioningHook=hook
+        )
+        assert iot_client.describe_provisioning_template(
+            templateName=name
+        )["preProvisioningHook"] == hook
+    finally:
+        iot_client.delete_provisioning_template(templateName=name)
+
+
 # ---------------------------------------------------------------------------
 # Fleet indexing (indexing configuration + SearchIndex)
 # ---------------------------------------------------------------------------
@@ -5013,6 +5217,67 @@ def test_iot_register_ca_certificate_duplicate_conflict(iot_client):
     assert err["Error"]["Code"] == "ResourceAlreadyExistsException"
     assert err["resourceId"] == ca_id
     assert err["resourceArn"].endswith(":cacert/" + ca_id)
+    iot_client.delete_ca_certificate(certificateId=ca_id)
+
+
+def test_iot_register_ca_certificate_mode_round_trip(iot_client):
+    ca_pem, _leaf = _generate_ca_and_leaf()
+
+    # An invalid mode is rejected up front — nothing is registered.
+    with pytest.raises(ClientError) as ei:
+        iot_client.register_ca_certificate(
+            caCertificate=ca_pem, certificateMode="BOGUS"
+        )
+    assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
+
+    ca_id = iot_client.register_ca_certificate(
+        caCertificate=ca_pem, certificateMode="SNI_ONLY"
+    )["certificateId"]
+    desc = iot_client.describe_ca_certificate(certificateId=ca_id)[
+        "certificateDescription"
+    ]
+    assert desc["certificateMode"] == "SNI_ONLY"
+    iot_client.delete_ca_certificate(certificateId=ca_id)
+
+    # An omitted mode reports AWS's default.
+    ca_id = iot_client.register_ca_certificate(caCertificate=ca_pem)["certificateId"]
+    desc = iot_client.describe_ca_certificate(certificateId=ca_id)[
+        "certificateDescription"
+    ]
+    assert desc["certificateMode"] == "DEFAULT"
+    iot_client.delete_ca_certificate(certificateId=ca_id)
+
+
+def test_iot_ca_certificate_registration_config_round_trip(iot_client):
+    """registrationConfig rides Register and Update and comes back as
+    DescribeCACertificate's top-level member — the JITR provisioning config."""
+    ca_pem, _leaf = _generate_ca_and_leaf()
+    cfg = {"roleArn": "arn:aws:iam::123456789012:role/jitr",
+           "templateName": "jitr-template"}
+    ca_id = iot_client.register_ca_certificate(
+        caCertificate=ca_pem, allowAutoRegistration=True, registrationConfig=cfg
+    )["certificateId"]
+
+    got = iot_client.describe_ca_certificate(certificateId=ca_id)
+    assert got["registrationConfig"] == cfg
+    assert got["certificateDescription"]["autoRegistrationStatus"] == "ENABLE"
+
+    # Update replaces the config, and removeAutoRegistration turns
+    # auto-registration off.
+    new_cfg = {"roleArn": "arn:aws:iam::123456789012:role/jitr-v2",
+               "templateBody": "{}"}
+    iot_client.update_ca_certificate(
+        certificateId=ca_id, registrationConfig=new_cfg, removeAutoRegistration=True
+    )
+    got = iot_client.describe_ca_certificate(certificateId=ca_id)
+    assert got["registrationConfig"] == new_cfg
+    assert got["certificateDescription"]["autoRegistrationStatus"] == "DISABLE"
+
+    # A CA registered without a config omits the member entirely.
+    iot_client.delete_ca_certificate(certificateId=ca_id)
+    ca_id = iot_client.register_ca_certificate(caCertificate=ca_pem)["certificateId"]
+    assert "registrationConfig" not in iot_client.describe_ca_certificate(
+        certificateId=ca_id)
     iot_client.delete_ca_certificate(certificateId=ca_id)
 
 
